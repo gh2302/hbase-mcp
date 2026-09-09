@@ -134,6 +134,11 @@ public final class HBaseMcpServer {
                 + "row keys and values round-trip exactly.");
         lines.add("- scan is capped at " + config.maxRows() + " rows (HBASE_MCP_MAX_ROWS); a "
                 + "result with \"truncated\": true means more rows exist past the last one shown.");
+        lines.add("- scan and count_rows filter on the region server, so unwanted rows and cells "
+                + "never cross the network. \"filter\" is a structured node (and/or, row_prefix, "
+                + "column_value, qualifier_prefix, value, ...) described by the tool schema; "
+                + "\"filter_string\" is the same thing as an HBase shell filter expression. "
+                + "Those two and scan's row_regex are combined with AND.");
         lines.add("- Cells are versioned by timestamp. get_row and scan return the newest version "
                 + "of each cell unless \"versions\" asks for more, and \"timestamp\" or "
                 + "\"start_time\"/\"end_time\" restrict which versions are visible; "

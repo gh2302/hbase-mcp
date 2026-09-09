@@ -3,7 +3,6 @@ package com.github.gh2302.hbasemcp;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.ClusterMetrics;
-import org.apache.hadoop.hbase.CompareOperator;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableName;
@@ -26,8 +25,6 @@ import org.apache.hadoop.hbase.filter.Filter;
 import org.apache.hadoop.hbase.filter.FilterList;
 import org.apache.hadoop.hbase.filter.FirstKeyOnlyFilter;
 import org.apache.hadoop.hbase.filter.KeyOnlyFilter;
-import org.apache.hadoop.hbase.filter.RegexStringComparator;
-import org.apache.hadoop.hbase.filter.RowFilter;
 import org.apache.hadoop.hbase.io.compress.Compression;
 import org.apache.hadoop.hbase.util.Bytes;
 
@@ -190,7 +187,7 @@ final class HBaseService implements AutoCloseable {
     }
 
     Map<String, Object> scan(String table, String startRow, String stopRow, String prefix,
-                             List<String> columns, String rowRegex, int limit,
+                             List<String> columns, Filters.Spec filterSpec, int limit,
                              boolean reversed, boolean includeValues, VersionSpec versions)
             throws IOException {
         int effectiveLimit = Math.max(1, Math.min(limit, config.maxRows()));
@@ -215,15 +212,18 @@ final class HBaseService implements AutoCloseable {
         applyColumns(columns, scan::addFamily, scan::addColumn);
 
         List<Filter> filters = new ArrayList<>();
-        if (rowRegex != null) {
-            filters.add(new RowFilter(CompareOperator.EQUAL, new RegexStringComparator(rowRegex)));
+        Filter requested = filterSpec.build();
+        if (requested != null) {
+            filters.add(requested);
         }
+        // KeyOnlyFilter goes last: it strips values on the way out, and the filters before it
+        // still see the original cell, so a value comparison above is unaffected.
         if (!includeValues) {
             filters.add(new KeyOnlyFilter());
         }
-        if (!filters.isEmpty()) {
-            scan.setFilter(filters.size() == 1 ? filters.get(0)
-                    : new FilterList(FilterList.Operator.MUST_PASS_ALL, filters));
+        Filter filter = Filters.all(filters);
+        if (filter != null) {
+            scan.setFilter(filter);
         }
 
         List<Map<String, Object>> rows = new ArrayList<>();
@@ -252,13 +252,26 @@ final class HBaseService implements AutoCloseable {
         return out;
     }
 
-    Map<String, Object> countRows(String table, String prefix, int max) throws IOException {
+    Map<String, Object> countRows(String table, String prefix, Filters.Spec filterSpec, int max)
+            throws IOException {
         int cap = Math.max(1, max);
         Scan scan = new Scan();
         scan.setCaching(1000);
-        // Ship back only the first key of each row; the payload never leaves the region server.
-        scan.setFilter(new FilterList(FilterList.Operator.MUST_PASS_ALL,
-                new FirstKeyOnlyFilter(), new KeyOnlyFilter()));
+
+        List<Filter> filters = new ArrayList<>();
+        Filter requested = filterSpec.build();
+        if (requested != null) {
+            // FirstKeyOnlyFilter would end the row at its first cell, so a filter looking at any
+            // other column would never see it. Counting under a filter therefore reads every cell
+            // of every candidate row -- more work on the region server, but a correct count.
+            filters.add(requested);
+        } else {
+            filters.add(new FirstKeyOnlyFilter());
+        }
+        // Either way the values are stripped server-side; the payload never crosses the network.
+        filters.add(new KeyOnlyFilter());
+        scan.setFilter(new FilterList(FilterList.Operator.MUST_PASS_ALL, filters));
+
         if (prefix != null) {
             scan.setStartStopRowForPrefixScan(Codec.toBytes(prefix));
         }
@@ -279,6 +292,7 @@ final class HBaseService implements AutoCloseable {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("table", table);
         out.put("count", count);
+        out.put("filtered", !filterSpec.isEmpty());
         out.put("stopped_at_max", hitCap);
         out.put("max", cap);
         return out;
@@ -545,10 +559,12 @@ final class HBaseService implements AutoCloseable {
      * Splits "family" or "family:qualifier"; the qualifier is null when absent. Only the first
      * colon separates, so qualifiers containing colons survive intact.
      *
+     * <p>Package-private because {@link Filters} parses the same selector syntax.
+     *
      * @param qualifierMayBeEmpty when true, a trailing colon means "the empty qualifier"
      *                            (a real thing in HBase) rather than "whole family"
      */
-    private static String[] splitColumn(String column, boolean qualifierMayBeEmpty) {
+    static String[] splitColumn(String column, boolean qualifierMayBeEmpty) {
         if (column == null || column.isEmpty()) {
             throw new IllegalArgumentException("Column selector must not be empty");
         }

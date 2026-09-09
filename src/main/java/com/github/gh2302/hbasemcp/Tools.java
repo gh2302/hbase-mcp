@@ -25,6 +25,72 @@ final class Tools {
         Object handle(Map<String, Object> args) throws Exception;
     }
 
+    /**
+     * The filter node, as one recursive definition shared by every tool that filters. Schemas
+     * ask for it by writing {@code %FILTER_DEFS%} where their "$defs" belongs; {@link #filtering}
+     * substitutes it. The Java side is {@link Filters}.
+     */
+    private static final String FILTER_DEFS = """
+            {
+                "filter": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": ["and", "or", "row", "row_prefix", "family", "qualifier", "qualifier_prefix", "qualifier_range", "value", "column_value", "first_key_only", "key_only", "column_count", "timestamps", "random_row"],
+                      "description": "What this node tests. \\"and\\"/\\"or\\" combine the nodes in \\"filters\\". \\"row\\", \\"family\\", \\"qualifier\\" and \\"value\\" compare that part of a cell using \\"compare\\" and one comparand; a row-key or qualifier comparison drops the row or the column, a value comparison drops only the cell. \\"column_value\\" tests one named \\"column\\" and keeps or drops the whole row on the result. \\"row_prefix\\" keeps rows whose key starts with \\"prefix\\". \\"qualifier_prefix\\" keeps columns whose qualifier starts with \\"prefix\\", or with any of \\"prefixes\\". \\"qualifier_range\\" keeps qualifiers between \\"start\\" and \\"stop\\". \\"first_key_only\\" keeps one cell per row, \\"key_only\\" strips the values, \\"column_count\\" keeps at most \\"limit\\" columns per row after skipping \\"offset\\". \\"timestamps\\" keeps only the versions written at those exact timestamps. \\"random_row\\" samples rows with probability \\"chance\\"."
+                    },
+                    "filters": {
+                      "type": "array", "minItems": 1, "items": {"$ref": "#/$defs/filter"},
+                      "description": "The nodes an \\"and\\" or \\"or\\" combines."
+                    },
+                    "compare": {
+                      "type": "string", "enum": ["eq", "ne", "lt", "lte", "gt", "gte"], "default": "eq",
+                      "description": "How to compare. Ordering comparisons are byte-wise, so they suit fixed-width keys and lexicographic text."
+                    },
+                    "value": {"type": "string", "description": "Compare against these exact bytes. Use a base64: prefix for binary."},
+                    "prefix": {"type": "string", "description": "Compare against a leading run of bytes. Also the prefix for \\"row_prefix\\" and \\"qualifier_prefix\\"."},
+                    "prefixes": {"type": "array", "minItems": 1, "items": {"type": "string"}, "description": "qualifier_prefix only: keep qualifiers starting with any of these prefixes. Combined with \\"prefix\\" if both are given."},
+                    "substring": {"type": "string", "description": "Match anywhere in the value, ignoring case. Use with compare eq or ne."},
+                    "regex": {"type": "string", "description": "Match as a regular expression. Use with compare eq or ne."},
+                    "column": {"type": "string", "description": "column_value only: the column to test, written \\"family:qualifier\\"."},
+                    "if_missing": {"type": "boolean", "default": true, "description": "column_value only: drop rows that do not have the column at all. HBase's own default is to keep them, which is rarely what a value test means."},
+                    "latest_version_only": {"type": "boolean", "default": true, "description": "column_value only: test the newest version of the column. Set false to keep a row when any retained version matches."},
+                    "exclude_column": {"type": "boolean", "default": false, "description": "column_value only: leave the tested column out of the result, keeping the rest of the row."},
+                    "start": {"type": "string", "description": "qualifier_range: first qualifier. Omit for unbounded."},
+                    "stop": {"type": "string", "description": "qualifier_range: last qualifier. Omit for unbounded."},
+                    "start_inclusive": {"type": "boolean", "default": true, "description": "qualifier_range: include the start qualifier itself."},
+                    "stop_inclusive": {"type": "boolean", "default": false, "description": "qualifier_range: include the stop qualifier itself."},
+                    "limit": {"type": "integer", "minimum": 1, "description": "column_count: how many columns of each row to keep."},
+                    "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "column_count: how many columns of each row to skip first."},
+                    "timestamps": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 0}, "description": "timestamps: the exact cell timestamps to keep, in epoch milliseconds."},
+                    "chance": {"type": "number", "minimum": 0, "maximum": 1, "description": "random_row: the probability of keeping each row."}
+                  },
+                  "required": ["type"],
+                  "additionalProperties": false
+                }
+            }
+            """;
+
+    /** The two filter arguments, for schemas that take them. */
+    private static final String FILTER_PROPERTIES = """
+                "filter": {
+                  "$ref": "#/$defs/filter",
+                  "description": "A server-side filter. Rows and cells that fail it are dropped on the region server and never cross the network, so filtering is far cheaper than reading everything and sifting it here."
+                },
+                "filter_string": {
+                  "type": "string",
+                  "description": "The same thing written as an HBase shell filter expression, e.g. \\"SingleColumnValueFilter('d', 'status', =, 'binary:SENT') AND ColumnPrefixFilter('item.')\\". Parsed by HBase's own parser."
+                },
+            """;
+
+    /** Fills a schema template's %FILTER_PROPERTIES% and %FILTER_DEFS% placeholders. */
+    private static String filtering(String template) {
+        return template
+                .replace("%FILTER_PROPERTIES%", FILTER_PROPERTIES)
+                .replace("%FILTER_DEFS%", FILTER_DEFS);
+    }
+
     static void register(McpServer.SyncSpecification<?> spec, McpJsonMapper mapper,
                          HBaseService hbase, Config config) {
 
@@ -119,11 +185,12 @@ final class Tools {
 
         add(spec, mapper, "scan",
                 "Scan a range of rows. Bound the scan with prefix, or with start_row/stop_row "
-                        + "(start inclusive, stop exclusive). Always returns at most "
-                        + config.maxRows() + " rows. Returns the newest version of each cell "
-                        + "unless versions, or a timestamp / start_time / end_time window, asks "
-                        + "for more.",
-                readOnly(), """
+                        + "(start inclusive, stop exclusive), and narrow it further with filter "
+                        + "or filter_string, which run on the region server. Always returns at "
+                        + "most " + config.maxRows() + " rows. Returns the newest version of each "
+                        + "cell unless versions, or a timestamp / start_time / end_time window, "
+                        + "asks for more.",
+                readOnly(), filtering("""
                 {
                   "type": "object",
                   "properties": {
@@ -132,6 +199,7 @@ final class Tools {
                     "start_row": {"type": "string", "description": "First row key to read, inclusive."},
                     "stop_row": {"type": "string", "description": "Stop before this row key, exclusive."},
                     "row_regex": {"type": "string", "description": "Only rows whose key matches this regular expression."},
+                %FILTER_PROPERTIES%
                     "columns": {
                       "type": "array",
                       "items": {"type": "string"},
@@ -158,39 +226,46 @@ final class Tools {
                     }
                   },
                   "required": ["table"],
-                  "additionalProperties": false
+                  "additionalProperties": false,
+                  "$defs": %FILTER_DEFS%
                 }
-                """,
+                """),
                 args -> hbase.scan(
                         requireString(args, "table"),
                         optString(args, "start_row"),
                         optString(args, "stop_row"),
                         optString(args, "prefix"),
                         optStringList(args, "columns"),
-                        optString(args, "row_regex"),
+                        filterSpec(args),
                         optInt(args, "limit", 50),
                         optBoolean(args, "reversed", false),
                         optBoolean(args, "include_values", true),
                         versionSpec(args)));
 
         add(spec, mapper, "count_rows",
-                "Count rows, optionally under a row-key prefix. This is a full scan of the range "
-                        + "on the server side, so it stops at max rows and says whether it did.",
-                readOnly(), """
+                "Count rows, optionally under a row-key prefix and optionally only those matching "
+                        + "a filter. This is a full scan of the range on the server side, so it "
+                        + "stops at max rows and says whether it did. A filtered count has to "
+                        + "read every cell of every candidate row, so it costs more than a plain "
+                        + "one: narrow it with prefix where you can.",
+                readOnly(), filtering("""
                 {
                   "type": "object",
                   "properties": {
                     "table": {"type": "string", "description": "Table name, optionally namespaced as ns:table."},
                     "prefix": {"type": "string", "description": "Only count rows whose key starts with this."},
+                %FILTER_PROPERTIES%
                     "max": {"type": "integer", "minimum": 1, "default": 100000, "description": "Stop counting here to bound the cost."}
                   },
                   "required": ["table"],
-                  "additionalProperties": false
+                  "additionalProperties": false,
+                  "$defs": %FILTER_DEFS%
                 }
-                """,
+                """),
                 args -> hbase.countRows(
                         requireString(args, "table"),
                         optString(args, "prefix"),
+                        filterSpec(args),
                         optInt(args, "max", 100_000)));
 
         if (config.readOnly()) {
@@ -378,6 +453,14 @@ final class Tools {
     }
 
     // ----------------------------------------------------- argument reading
+
+    /** Reads the filter arguments shared by scan and count_rows. */
+    private static Filters.Spec filterSpec(Map<String, Object> args) {
+        return new Filters.Spec(
+                args.get("filter"),
+                optString(args, "filter_string"),
+                optString(args, "row_regex"));
+    }
 
     /** Reads the versioning arguments shared by get_row and scan. */
     private static VersionSpec versionSpec(Map<String, Object> args) {

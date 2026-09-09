@@ -98,8 +98,8 @@ Read-only, always available:
 | `list_tables` | Tables and their column families; filter by `namespace` or `regex`. |
 | `describe_table` | Enabled state, column family settings, region count and split points. |
 | `get_row` | One row by exact key, optionally limited to certain columns, at any point in its version history. |
-| `scan` | A row range, bounded by `prefix` or `start_row`/`stop_row`, with an optional `row_regex`. Takes the same version arguments as `get_row`. Set `include_values: false` for a much cheaper keys-only scan. |
-| `count_rows` | Counts rows server-side under an optional prefix, stopping at `max`. |
+| `scan` | A row range, bounded by `prefix` or `start_row`/`stop_row` and narrowed by a `filter`. Takes the same version arguments as `get_row`. Set `include_values: false` for a much cheaper keys-only scan. |
+| `count_rows` | Counts rows server-side under an optional prefix and `filter`, stopping at `max`. |
 
 Registered unless `HBASE_MCP_READ_ONLY=true`:
 
@@ -142,6 +142,84 @@ while a packed `long` reads as:
 
 **Scans** are capped at `HBASE_MCP_MAX_ROWS`. A result with `"truncated": true` means more rows
 exist past the last one shown; continue with `start_row` set past that key.
+
+## Filters
+
+`scan` and `count_rows` filter on the region server: rows and cells that fail the filter are
+dropped there and never cross the network, which is a different thing entirely from reading
+everything and sifting it afterwards. There are two ways to write one and they compose — a
+`filter`, a `filter_string` and `scan`'s `row_regex` are combined with AND.
+
+**`filter`** is a JSON node with a `type`. `and` and `or` nodes nest, up to eight deep:
+
+```json
+{
+  "type": "and",
+  "filters": [
+    {"type": "column_value", "column": "d:status", "value": "SENT"},
+    {"type": "qualifier_prefix", "prefix": "item."}
+  ]
+}
+```
+
+| `type` | What it keeps |
+|---|---|
+| `and`, `or` | The nodes in `filters`, combined. |
+| `row` | Rows whose key satisfies the comparison. |
+| `row_prefix` | Rows whose key starts with `prefix`. |
+| `family` | Cells whose column family satisfies the comparison. |
+| `qualifier` | Cells whose qualifier satisfies the comparison. |
+| `qualifier_prefix` | Cells whose qualifier starts with `prefix`, or with any of `prefixes`. |
+| `qualifier_range` | Cells whose qualifier lies between `start` and `stop`. |
+| `value` | Cells whose value satisfies the comparison. |
+| `column_value` | Whole rows, judged on the value of the one `column`. |
+| `first_key_only` | One cell of each row — enough to know the row exists. |
+| `key_only` | Every cell, with the values stripped. |
+| `column_count` | At most `limit` columns of each row, after skipping `offset`. |
+| `timestamps` | Only the versions written at exactly these `timestamps`. |
+| `random_row` | Each row with probability `chance`. A cheap sample of a big table. |
+
+Note which ones drop a row and which drop a cell: a `value` filter removes the cells that fail
+it and leaves the rest of the row, while `column_value` tests one column and keeps or drops the
+whole row on the answer.
+
+The comparing types — `row`, `family`, `qualifier`, `value` and `column_value` — take a
+`compare` of `eq`, `ne`, `lt`, `lte`, `gt` or `gte` (default `eq`) and exactly one comparand:
+
+| Comparand | Compared how |
+|---|---|
+| `value` | Byte for byte. Use a `base64:` prefix for binary, so a packed `long` compares correctly. |
+| `prefix` | Against a leading run of bytes. |
+| `substring` | Anywhere in the value, ignoring case. |
+| `regex` | As a regular expression. |
+
+Ordering comparisons are byte-wise, which is the ordering row keys already have: it means what
+you expect for fixed-width binary and for ASCII text, and nothing useful for a number written as
+text of varying length.
+
+`column_value` needs `column` as `family:qualifier`, and inverts two HBase defaults because the
+HBase ones surprise people. `if_missing` defaults to `true`, so rows that lack the column
+entirely are dropped rather than kept. `latest_version_only` defaults to `true`, so an older
+version cannot bring a row back. Set either to `false` for HBase's own behaviour, and set
+`exclude_column: true` to leave the tested column out of the result.
+
+**`filter_string`** is the same thing written as the HBase shell writes it, handed to HBase's own
+parser:
+
+```json
+{
+  "table": "ems:MailEvents",
+  "filter_string": "SingleColumnValueFilter('d', 'status', =, 'binary:SENT') AND ColumnPrefixFilter('item.')"
+}
+```
+
+It reaches filters the structured form does not expose, and it takes a filter someone already
+has unchanged. The parser is strict about quoting and reports little more than
+`Incorrect Filter String` when it is unhappy, so prefer `filter` unless you are pasting.
+
+A filtered `count_rows` costs more than a plain one. Counting without a filter reads the first
+cell of each row and stops; counting with one has to read every cell of every candidate row,
+because the column being tested may be any of them. Narrow it with `prefix` where you can.
 
 ## Versions
 
