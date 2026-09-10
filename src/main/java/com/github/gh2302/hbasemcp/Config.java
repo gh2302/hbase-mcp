@@ -26,14 +26,16 @@ final class Config {
     private final boolean readOnly;
     private final boolean allowDestructive;
     private final int maxRows;
+    private final int countCaching;
     private final int operationTimeoutMs;
 
     private Config(Configuration hadoop, boolean readOnly, boolean allowDestructive,
-                   int maxRows, int operationTimeoutMs) {
+                   int maxRows, int countCaching, int operationTimeoutMs) {
         this.hadoop = hadoop;
         this.readOnly = readOnly;
         this.allowDestructive = allowDestructive;
         this.maxRows = maxRows;
+        this.countCaching = countCaching;
         this.operationTimeoutMs = operationTimeoutMs;
     }
 
@@ -75,11 +77,22 @@ final class Config {
         hadoop.setInt("hbase.client.pause", 200);
         hadoop.setInt("zookeeper.recovery.retry", 1);
 
+        // Cell blocks are nearly all of a scan response, and they compress well: the row keys in
+        // a batch are sorted and share long prefixes. The codec is named in the connection header
+        // and the region server honours it, so this needs nothing on the cluster beyond the class
+        // being on its classpath -- but a codec it cannot build kills the connection, which is
+        // why it is off unless asked for.
+        String compression = env("HBASE_MCP_RPC_COMPRESSION");
+        if (compression != null && !compression.equalsIgnoreCase("none")) {
+            hadoop.set("hbase.client.rpc.compressor", compressorClass(compression));
+        }
+
         return new Config(
                 hadoop,
                 envBool("HBASE_MCP_READ_ONLY", false),
                 envBool("HBASE_MCP_ALLOW_DESTRUCTIVE", false),
                 envInt("HBASE_MCP_MAX_ROWS", 1000),
+                envInt("HBASE_MCP_COUNT_CACHING", 10_000),
                 operationTimeoutMs);
     }
 
@@ -124,6 +137,11 @@ final class Config {
         return maxRows;
     }
 
+    /** How many rows a count asks for per RPC. Its rows are key-only, so a large batch is small. */
+    int countCaching() {
+        return Math.max(1, countCaching);
+    }
+
     int operationTimeoutMs() {
         return operationTimeoutMs;
     }
@@ -134,6 +152,17 @@ final class Config {
         int port = hadoop.getInt(HConstants.ZOOKEEPER_CLIENT_PORT, 2181);
         String znode = hadoop.get(HConstants.ZOOKEEPER_ZNODE_PARENT, "/hbase");
         return quorum + ":" + port + znode;
+    }
+
+    /** Maps the short name of a compression codec to its class, and passes anything else through. */
+    private static String compressorClass(String name) {
+        return switch (name.toLowerCase()) {
+            case "gzip" -> "org.apache.hadoop.io.compress.GzipCodec";
+            case "snappy" -> "org.apache.hadoop.io.compress.SnappyCodec";
+            case "lz4" -> "org.apache.hadoop.io.compress.Lz4Codec";
+            case "zstd" -> "org.apache.hadoop.io.compress.ZStandardCodec";
+            default -> name;
+        };
     }
 
     private static String env(String key) {

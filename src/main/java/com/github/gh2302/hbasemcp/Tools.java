@@ -245,9 +245,12 @@ final class Tools {
         add(spec, mapper, "count_rows",
                 "Count rows, optionally under a row-key prefix and optionally only those matching "
                         + "a filter. This is a full scan of the range on the server side, so it "
-                        + "stops at max rows and says whether it did. A filtered count has to "
-                        + "read every cell of every candidate row, so it costs more than a plain "
-                        + "one: narrow it with prefix where you can.",
+                        + "stops at max rows and says whether it did. Values never cross the "
+                        + "network, and the reads field in the result says how much of each row "
+                        + "did: first_cell for a plain count or one filtered on the row key, "
+                        + "filter_columns when the filter tests named columns, all_cells when it "
+                        + "could be looking at any column and the whole row has to be read. "
+                        + "Narrow it with prefix where you can.",
                 readOnly(), filtering("""
                 {
                   "type": "object",

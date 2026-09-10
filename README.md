@@ -53,6 +53,8 @@ It reads `core-site.xml`, `hdfs-site.xml` and `hbase-site.xml` if present, in th
 | `HBASE_MCP_READ_ONLY` | `false` | When true, only the read tools are registered |
 | `HBASE_MCP_ALLOW_DESTRUCTIVE` | `false` | When true, adds `drop_table` and `truncate_table` |
 | `HBASE_MCP_MAX_ROWS` | `1000` | Hard ceiling on rows returned by `scan` |
+| `HBASE_MCP_COUNT_CACHING` | `10000` | Rows `count_rows` asks for per RPC |
+| `HBASE_MCP_RPC_COMPRESSION` | `none` | Compress RPC cell blocks: `gzip`, `snappy`, `lz4`, `zstd` or a codec class |
 | `HBASE_MCP_RPC_TIMEOUT_MS` | `30000` | Per-RPC timeout |
 | `HBASE_MCP_OPERATION_TIMEOUT_MS` | `60000` | Whole-operation timeout |
 | `HBASE_MCP_RETRIES` | `3` | Client retry count |
@@ -62,6 +64,13 @@ The timeout and retry settings are imposed on top of any `hbase-site.xml`, delib
 defaults are tuned for batch jobs — `hbase.rpc.timeout` of 5 minutes with 35 retries is common —
 which would leave an interactive tool call hanging for the better part of an hour. Set the
 `HBASE_MCP_*` variables explicitly if you want the cluster's own values.
+
+Over a slow or metered link, `HBASE_MCP_RPC_COMPRESSION=gzip` is the one setting worth trying.
+Cell blocks are nearly all of a scan or count response, and the row keys in one batch are sorted
+and share long prefixes, so they compress hard. The client names the codec in its connection
+header and the region server honours it — no cluster change is needed, only the codec class on
+the region server's classpath, which `gzip` always is. It is off by default because a codec the
+server cannot build fails the connection outright rather than falling back.
 
 ## Register with an MCP client
 
@@ -99,7 +108,7 @@ Read-only, always available:
 | `describe_table` | Enabled state, column family settings, region count and split points. |
 | `get_row` | One row by exact key, optionally limited to certain columns, at any point in its version history. |
 | `scan` | A row range, bounded by `prefix` or `start_row`/`stop_row` and narrowed by a `filter`. Takes the same version arguments as `get_row`. Set `include_values: false` for a much cheaper keys-only scan. |
-| `count_rows` | Counts rows server-side under an optional prefix and `filter`, stopping at `max`. |
+| `count_rows` | Counts rows server-side under an optional prefix and `filter`, stopping at `max`. Ships a key, not a row. |
 
 Registered unless `HBASE_MCP_READ_ONLY=true`:
 
@@ -217,9 +226,17 @@ It reaches filters the structured form does not expose, and it takes a filter so
 has unchanged. The parser is strict about quoting and reports little more than
 `Incorrect Filter String` when it is unhappy, so prefer `filter` unless you are pasting.
 
-A filtered `count_rows` costs more than a plain one. Counting without a filter reads the first
-cell of each row and stops; counting with one has to read every cell of every candidate row,
-because the column being tested may be any of them. Narrow it with `prefix` where you can.
+A `count_rows` result reports how much of each row it had to read, in `reads`:
+
+| `reads` | When | Cost |
+|---|---|---|
+| `first_cell` | No filter, or one that only tests the row key — `prefix`, `row_regex`, `row`, `row_prefix`, `random_row` | One cell per row, values stripped |
+| `filter_columns` | Every part of the filter is a `column_value` that drops rows missing its column, ANDed with row-key tests | Only those columns per row |
+| `all_cells` | Anything else: the column being tested could be any of them | Every cell of every candidate row |
+
+Only the count comes back, but every row still crosses the network once on the way to it, so
+narrow the range with `prefix` where you can. Writing a filter as `column_value` rather than a
+bare `value` or `qualifier` test is what keeps a count in the middle row instead of the last one.
 
 ## Versions
 

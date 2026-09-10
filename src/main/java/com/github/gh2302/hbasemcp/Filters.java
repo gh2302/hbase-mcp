@@ -91,6 +91,83 @@ final class Filters {
         };
     }
 
+    // ------------------------------------------------- what a filter has to read
+
+    /**
+     * True when every filter in the tree decides on the row key alone.
+     *
+     * <p>Such a filter never looks at a cell, so a count under it can stop each row at its first
+     * one -- the rest would be shipped only to be thrown away. Anything unrecognised is treated
+     * as cell-inspecting, which is the answer that cannot be wrong.
+     */
+    static boolean rowKeyOnly(Filter filter) {
+        if (filter == null) {
+            return true;
+        }
+        if (filter instanceof FilterList list) {
+            for (Filter child : list.getFilters()) {
+                if (!rowKeyOnly(child)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return filter instanceof RowFilter
+                || filter instanceof PrefixFilter
+                || filter instanceof RandomRowFilter
+                || filter instanceof FirstKeyOnlyFilter
+                || filter instanceof KeyOnlyFilter;
+    }
+
+    /**
+     * The columns a cell-inspecting filter actually needs, or null when that cannot be settled.
+     *
+     * <p>Restricting the scan to them makes the region server open fewer stores and ship one cell
+     * per row instead of every column the row happens to have. It is only sound when each part of
+     * the filter either ignores cells entirely or is a column test that drops rows missing the
+     * column, and only under AND: under OR a row could pass on its key alone while carrying none
+     * of these columns, and a scan narrowed to them would never surface it.
+     */
+    static List<byte[][]> requiredColumns(Filter filter) {
+        Map<String, byte[][]> columns = new LinkedHashMap<>();
+        if (!collectColumns(filter, columns) || columns.isEmpty()) {
+            return null;
+        }
+        return new ArrayList<>(columns.values());
+    }
+
+    private static boolean collectColumns(Filter filter, Map<String, byte[][]> into) {
+        if (rowKeyOnly(filter)) {
+            return true;
+        }
+        if (filter instanceof FilterList list) {
+            if (list.getOperator() != FilterList.Operator.MUST_PASS_ALL) {
+                return false;
+            }
+            for (Filter child : list.getFilters()) {
+                if (!collectColumns(child, into)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        // The exclude variant strips the very column it tests from the row it keeps, so a scan
+        // narrowed to that column would leave the row with no cells at all and lose it.
+        if (filter instanceof SingleColumnValueExcludeFilter) {
+            return false;
+        }
+        // getFilterIfMissing is the whole question: with it off the filter keeps rows that lack
+        // the column, and a scan restricted to that column returns nothing for them at all.
+        if (filter instanceof SingleColumnValueFilter column && column.getFilterIfMissing()) {
+            byte[] family = column.getFamily();
+            byte[] qualifier = column.getQualifier();
+            into.put(Bytes.toStringBinary(family) + ":" + Bytes.toStringBinary(qualifier),
+                    new byte[][] {family, qualifier});
+            return true;
+        }
+        return false;
+    }
+
     /** Parses an HBase shell filter expression with HBase's own parser. */
     private static Filter parse(String expression) {
         try {

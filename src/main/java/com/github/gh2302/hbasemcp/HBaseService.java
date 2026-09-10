@@ -22,7 +22,6 @@ import org.apache.hadoop.hbase.client.Table;
 import org.apache.hadoop.hbase.client.TableDescriptor;
 import org.apache.hadoop.hbase.client.TableDescriptorBuilder;
 import org.apache.hadoop.hbase.filter.Filter;
-import org.apache.hadoop.hbase.filter.FilterList;
 import org.apache.hadoop.hbase.filter.FirstKeyOnlyFilter;
 import org.apache.hadoop.hbase.filter.KeyOnlyFilter;
 import org.apache.hadoop.hbase.io.compress.Compression;
@@ -252,25 +251,56 @@ final class HBaseService implements AutoCloseable {
         return out;
     }
 
+    /**
+     * Counts rows in a range, doing as little over the wire as the filter allows.
+     *
+     * <p>A count is the one read whose answer is smaller than the data it comes from, and every
+     * row still crosses the network once because only the client can add them up. So the work
+     * here is to make each of those rows as small as it can be: no values, and where possible no
+     * more than a single cell.
+     */
     Map<String, Object> countRows(String table, String prefix, Filters.Spec filterSpec, int max)
             throws IOException {
         int cap = Math.max(1, max);
         Scan scan = new Scan();
-        scan.setCaching(1000);
+        // Rows are down to a key by the time they ship, so a batch of them is tiny: ask for many
+        // per RPC and pay the round trip to a remote cluster far fewer times. The cluster's
+        // hbase.client.scanner.max.result.size still caps what one response may carry.
+        scan.setCaching(config.countCaching());
+        // The range is read once and never returned to, so keep it out of the block cache: a
+        // count of a whole table would otherwise evict everything the cluster is serving. Read
+        // type is left alone, so HBase still switches from positioned reads to streaming on its
+        // own once the scan proves to be a long one.
+        scan.setCacheBlocks(false);
 
         List<Filter> filters = new ArrayList<>();
         Filter requested = filterSpec.build();
         if (requested != null) {
-            // FirstKeyOnlyFilter would end the row at its first cell, so a filter looking at any
-            // other column would never see it. Counting under a filter therefore reads every cell
-            // of every candidate row -- more work on the region server, but a correct count.
             filters.add(requested);
-        } else {
+        }
+
+        List<byte[][]> needed = Filters.requiredColumns(requested);
+        String reads;
+        if (Filters.rowKeyOnly(requested)) {
+            // Nothing here looks at a cell -- a plain count, or one filtered on the row key --
+            // so end every row at its first cell.
             filters.add(new FirstKeyOnlyFilter());
+            reads = "first_cell";
+        } else if (needed != null) {
+            // FirstKeyOnlyFilter would end the row before the filter had seen the column it
+            // tests, so narrow the scan to the columns it needs instead. Same rows, but a wide
+            // row ships one or two cells rather than all of them.
+            for (byte[][] column : needed) {
+                scan.addColumn(column[0], column[1]);
+            }
+            reads = "filter_columns";
+        } else {
+            // A filter that could be looking at any column: every cell of every candidate row.
+            reads = "all_cells";
         }
         // Either way the values are stripped server-side; the payload never crosses the network.
         filters.add(new KeyOnlyFilter());
-        scan.setFilter(new FilterList(FilterList.Operator.MUST_PASS_ALL, filters));
+        scan.setFilter(Filters.all(filters));
 
         if (prefix != null) {
             scan.setStartStopRowForPrefixScan(Codec.toBytes(prefix));
@@ -293,10 +323,12 @@ final class HBaseService implements AutoCloseable {
         out.put("table", table);
         out.put("count", count);
         out.put("filtered", !filterSpec.isEmpty());
+        out.put("reads", reads);
         out.put("stopped_at_max", hitCap);
         out.put("max", cap);
         return out;
     }
+
 
     // ----------------------------------------------------------------- writes
 
